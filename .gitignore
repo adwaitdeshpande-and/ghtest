@@ -16,3 +16,12 @@ data/detections/Corporate.detections.json
 *.pt
 weights/
 data/detections/Corporate_2.detections.json
+
+# large artifacts
+*.pt
+*.onnx
+*.mp4
+weights/
+runs/
+ultralytics/
+.venv/
