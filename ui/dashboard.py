@@ -1109,3 +1109,4 @@ with tab_verify:
             st.code(f"printed report_sha256: {res.get('printed_sha256')}\ncomputed sha256:     {res.get('computed_sha256')}", language="text")
         except requests.HTTPError as e:
             st.error(f"Verify failed ({getattr(e.response,'status_code','HTTP')}): {e.response.text if e.response else ''}")
+#
