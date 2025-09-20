@@ -409,7 +409,12 @@ with tab_detect:
                     st.image(img_prev, caption=f"Frame {frame_choice} with overlays", use_container_width=True)
                 else: st.info("No detections found on sampled frames.")
 
-            st.divider(); st.markdown("### Track Events"); st.json(tracks) if tracks else st.write("No tracks created.")
+            st.divider() 
+            st.markdown("### Track Events") 
+            if tracks:
+                st.json(tracks)
+            else: 
+                st.write("No tracks created.")
             st.divider(); st.markdown("### Raw Detection JSON")
             with st.expander("Show JSON"): st.code(json.dumps(result, indent=2), language="json")
             st.download_button(label="Download detection JSON", data=json.dumps(result, indent=2), file_name=f"{Path(sel_file).stem}_detection.json", mime="application/json", key="detect_download_json")
