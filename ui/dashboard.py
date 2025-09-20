@@ -26,12 +26,35 @@ def api_ingest(file_bytes: bytes, filename: str) -> dict:
     files = {"file": (filename, file_bytes, mimetypes.guess_type(filename)[0] or "application/octet-stream")}
     r = requests.post(f"{API_BASE}/ingest", files=files, timeout=60); r.raise_for_status(); return r.json()
 
+def _api_base_api() -> str:
+    # helper: ensure we can hit either root or /api
+    return API_BASE if API_BASE.rstrip("/").endswith("/api") else API_BASE.rstrip("/") + "/api"
+
 def api_list_files() -> dict:
-    r = requests.get(f"{API_BASE}/files", timeout=10); r.raise_for_status(); return r.json()
+    # prefer existing root route /files; if 404, fallback to /api/files
+    url1 = f"{API_BASE}/files"
+    url2 = f"{_api_base_api()}/files"
+    try:
+        r = requests.get(url1, timeout=10)
+        if r.status_code == 404:
+            r2 = requests.get(url2, timeout=10); r2.raise_for_status(); return r2.json()
+        r.raise_for_status(); return r.json()
+    except requests.HTTPError:
+        # final fallback
+        r2 = requests.get(url2, timeout=10); r2.raise_for_status(); return r2.json()
 
 def api_delete_file(stored_name: str, deep: bool) -> dict:
-    r = requests.delete(f"{API_BASE}/files/{stored_name}", params={"deep": str(deep).lower()}, timeout=30)
-    r.raise_for_status(); return r.json()
+    # try root; if 404, try /api
+    params = {"deep": str(deep).lower()}
+    url1 = f"{API_BASE}/files/{stored_name}"
+    url2 = f"{_api_base_api()}/files/{stored_name}"
+    # first attempt
+    r = requests.delete(url1, params=params, timeout=30)
+    if r.status_code == 404:
+        r = requests.delete(url2, params=params, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
 
 def api_forensics_files() -> dict:
     r = requests.get(f"{API_BASE}/forensics/files", timeout=10); r.raise_for_status(); return r.json()
@@ -66,9 +89,42 @@ def api_faces_search(file_bytes: bytes, filename: str, top_k: int) -> dict:
     data = {"top_k": str(int(top_k))}
     r = requests.post(f"{API_BASE}/faces/search", files=files, data=data, timeout=120); r.raise_for_status(); return r.json()
 
+def _api_base_api() -> str:
+    """Return API base ending with /api (for backends mounted under /api)."""
+    return API_BASE if API_BASE.rstrip("/").endswith("/api") else API_BASE.rstrip("/") + "/api"
+
+def _sanitize_embedding(vec) -> List[float]:
+    """Ensure JSON-serializable list[float] and finite values."""
+    out: List[float] = []
+    for v in (vec or []):
+        try:
+            f = float(v)
+        except Exception:
+            continue
+        if np.isfinite(f):
+            out.append(f)
+    return out
+
 def api_faces_search_by_embedding(embedding: List[float], top_k: int) -> dict:
-    payload = {"embedding": embedding, "top_k": int(top_k)}
-    r = requests.post(f"{API_BASE}/faces/search/by-embedding", json=payload, timeout=60); r.raise_for_status(); return r.json()
+    """
+    Tries /faces/search/by-embedding on both roots:
+    1) {API_BASE}/faces/search/by-embedding
+    2) {API_BASE or .../api}/faces/search/by-embedding
+    """
+    payload = {"embedding": _sanitize_embedding(embedding), "top_k": int(top_k)}
+    if not payload["embedding"]:
+        raise ValueError("Empty/invalid embedding vector.")
+
+    # Try root first
+    url1 = f"{API_BASE}/faces/search/by-embedding"
+    url2 = f"{_api_base_api()}/faces/search/by-embedding"
+
+    r = requests.post(url1, json=payload, timeout=60)
+    if r.status_code == 404:
+        r = requests.post(url2, json=payload, timeout=60)
+    r.raise_for_status()
+    return r.json()
+
 
 def api_ela_by_filename(stored_name: str, jpeg_quality: int, hi_thresh: int, frame_idx: int | None) -> dict:
     params = {"jpeg_quality": int(jpeg_quality), "hi_thresh": int(hi_thresh)}
@@ -290,7 +346,9 @@ with tab_forensics:
                         with st.expander("Raw ffprobe JSON"): st.code(json.dumps(details["ffprobe"], indent=2), language="json")
             else:
                 st.info("File type not recognized as image/video. Raw details:"); st.json(details)
-            st.divider(); with st.expander("Full Forensic Summary (raw JSON)"): st.code(json.dumps(summary, indent=2), language="json")
+            st.divider()
+            with st.expander("Full Forensic Summary (raw JSON)"):
+                st.code(json.dumps(summary, indent=2), language="json")
 
 # --------- Detection Tab ---------
 with tab_detect:
@@ -443,8 +501,182 @@ with tab_detect:
                     st.warning(f"Could not read findings: {e}")
 
 # --------- Faces Tab ---------
-# (unchanged from your last working version; omitted here to keep this file readable)
-# NOTE: the complete code includes the Faces tab exactly as before.
+with tab_faces:
+    st.subheader("Faces: Build Index & Search")
+
+    # fetch list of stored files
+    f_listing = api_forensics_files()
+    all_files: List[str] = f_listing.get("files", [])
+
+    left, right = st.columns([2, 3])
+
+    # ---------------- Left: Index + Preview ----------------
+    with left:
+        st.markdown("#### 1) Index Builder")
+        st.caption("Add faces from a stored image/video to the in-memory index.")
+        image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".webm"}
+        video_exts = {".mp4", ".mov", ".mkv", ".avi"}
+        faceable_files = [f for f in all_files if Path(f).suffix.lower() in image_exts.union(video_exts)]
+
+        idx_file = st.selectbox(
+            "Stored filename",
+            options=["-- select --"] + faceable_files,
+            index=0,
+            key="faces_index_sel",
+        )
+        sample_fps = st.slider("Sample FPS (video only)", 0.1, 10.0, 1.0, 0.1, key="faces_samplefps")
+        max_frames = st.number_input("Max frames to sample (video)", min_value=1, value=50, key="faces_maxframes")
+        max_faces = st.number_input("Max faces to add", min_value=1, max_value=10000, value=500, key="faces_maxfaces")
+
+        col_btn1, col_btn2 = st.columns(2)
+        if col_btn1.button("Add faces to index", type="primary", disabled=(idx_file == "-- select --"), key="faces_add_btn"):
+            resp = api_faces_index_add_by_filename(
+                idx_file, sample_fps=float(sample_fps), max_frames=int(max_frames), max_faces=int(max_faces)
+            )
+            st.success(f"Added: {resp.get('added', 0)}  |  Total in index: {resp.get('total', 0)}")
+            st.session_state["_face_index_stats"] = api_faces_index_stats()
+
+        if col_btn2.button("Reset index", type="secondary", key="faces_reset_btn"):
+            api_faces_index_reset()
+            st.session_state["_face_index_stats"] = {"count": 0}
+            st.info("Face index reset.")
+
+        # stats
+        stats = st.session_state.get("_face_index_stats")
+        if not stats:
+            stats = api_faces_index_stats()
+            st.session_state["_face_index_stats"] = stats
+        st.metric("Index size (faces)", stats.get("count", 0))
+
+        st.markdown("---")
+        st.markdown("#### 2) Extract (Preview Only, optional)")
+        st.caption("See detected faces from a stored file (does not change index).")
+        prev_file = st.selectbox(
+            "Pick file to preview faces",
+            options=["-- select --"] + faceable_files,
+            index=0,
+            key="faces_preview_sel",
+        )
+        if st.button("Preview detected faces", key="faces_preview_btn"):
+            if prev_file == "-- select --":
+                st.warning("Pick a stored file first.")
+            else:
+                out = api_faces_extract_by_filename(prev_file, sample_fps=float(sample_fps), max_frames=int(max_frames))
+                faces = out.get("faces", [])
+                st.session_state["_faces_preview_list"] = faces
+                st.session_state["_faces_preview_source"] = prev_file
+                st.write(f"Found faces: **{len(faces)}** (showing up to 12)")
+
+        # Render preview gallery with "Use this face as query"
+        faces_prev = st.session_state.get("_faces_preview_list", [])
+        faces_src = st.session_state.get("_faces_preview_source")
+        if faces_prev and faces_src:
+            show_n = min(12, len(faces_prev))
+            for i in range(show_n):
+                f = faces_prev[i]
+                crop = crop_from_source(faces_src, f.get("bbox", [0, 0, 0, 0]), f.get("frame_idx"))
+                c1, c2 = st.columns([1, 1])
+                with c1:
+                    if crop is not None:
+                        st.image(
+                            crop,
+                            caption=f"Face {i+1} | score≈{f.get('det_score', 0):.2f} | sharp={f.get('sharpness', 0):.1f}",
+                            use_container_width=True,
+                        )
+                    else:
+                        st.text(f"Face {i+1} (preview unavailable)")
+                with c2:
+                    st.write(f"**BBox:** {f.get('bbox')}")
+                    st.write(f"**Frame:** {f.get('frame_idx')}")
+                    st.write(f"**Timestamp (s):** {f.get('ts_sec')}")
+                    topk = st.slider(f"Top-K (Face {i+1})", 1, 20, 5, 1, key=f"topk_face_{i}")
+                    if st.button("Use this face as query", key=f"use_face_{i}", type="primary"):
+                        embedding = f.get("normed_embedding", [])
+                        if not embedding:
+                            st.warning("No embedding attached to this face.")
+                        else:
+                            # Ensure index has entries first
+                            stats = st.session_state.get("_face_index_stats") or api_faces_index_stats()
+                            if (stats or {}).get("count", 0) <= 0:
+                                st.warning("Face index is empty. Add faces to the index first (left pane).")
+                            else:
+                                try:
+                                    # Many backends expect a specific dimension (e.g., 512). We sanitize but don't force-resize.
+                                    resp = api_faces_search_by_embedding(embedding, int(topk))
+                                    st.session_state[f"_face_query_result_{i}"] = resp
+                                    st.success(f"Search ran for Face {i+1}. See results below.")
+                                except requests.HTTPError as e:
+        # Show server’s 4xx/5xx text so you can see the reason (dim mismatch / no face / bad payload, etc.)
+                                    status = getattr(e.response, "status_code", "HTTP")
+                                    detail = ""
+                                    try:
+                                        detail = e.response.text
+                                    except Exception:
+                                        pass
+                                    st.error(f"Search failed ({status}). {detail or 'See server logs.'}")
+                                except ValueError as ve:
+                                    st.warning(f"{ve}")
+                                except Exception as ex:
+                                    st.error(f"Search failed: {ex}")
+
+
+                # Show results for this face if present
+                res = st.session_state.get(f"_face_query_result_{i}")
+                if res:
+                    results = res.get("results", [])
+                    st.markdown(f"**Results for Face {i+1} (top {res.get('top_k', len(results))}):**")
+                    if not results:
+                        st.info("No matches.")
+                    else:
+                        for j, r in enumerate(results):
+                            rc1, rc2 = st.columns([1, 1])
+                            with rc1:
+                                cropm = crop_from_source(r.get("source_file", ""), r.get("bbox", [0, 0, 0, 0]), r.get("frame_idx"))
+                                if cropm is not None:
+                                    st.image(cropm, caption=f"Match {j+1} | score={r.get('score', 0):.3f}", use_container_width=True)
+                                else:
+                                    st.text(f"Match {j+1} (preview unavailable)")
+                            with rc2:
+                                st.write(f"**Source file:** `{r.get('source_file')}`")
+                                st.write(f"**Frame:** {r.get('frame_idx')}")
+                                st.write(f"**Timestamp (s):** {r.get('ts_sec')}")
+                                st.write(f"**BBox:** {r.get('bbox')}")
+
+    # ---------------- Right: Query Image Search ----------------
+    with right:
+        st.markdown("#### 3) Search by Query Image")
+        st.caption("Upload a face image; we’ll detect the largest face and cosine-search the index.")
+        query = st.file_uploader("Query face image", type=["jpg", "jpeg", "png", "bmp", "webp"], key="face_query_uploader")
+        top_k = st.slider("Top-K results", 1, 20, 5, 1, key="face_query_topk")
+        if st.button("Search", type="primary", disabled=(query is None), key="face_query_searchbtn"):
+            try:
+                resp = api_faces_search(query.getvalue(), query.name, int(top_k))
+                st.success(f"Faces in query: {resp.get('query_faces_found', 0)}")
+                results = resp.get("results", [])
+                if not results:
+                    st.info("No matches returned (index might be empty).")
+                else:
+                    for i, r in enumerate(results):
+                        col_img, col_meta = st.columns([1, 1])
+                        with col_img:
+                            crop = crop_from_source(r.get("source_file", ""), r.get("bbox", [0, 0, 0, 0]), r.get("frame_idx"))
+                            if crop is not None:
+                                st.image(crop, caption=f"Match {i+1}  |  score={r.get('score', 0):.3f}", use_container_width=True)
+                            else:
+                                st.text(f"Match {i+1}: (preview unavailable)")
+                        with col_meta:
+                            st.write(f"**Source file:** `{r.get('source_file')}`")
+                            st.write(f"**Frame:** {r.get('frame_idx')}")
+                            st.write(f"**Timestamp (s):** {r.get('ts_sec')}")
+                            st.write(f"**BBox:** {r.get('bbox')}")
+            except requests.HTTPError as e:
+                # Show backend detail (e.g., "Face index is empty" or "No face detected...")
+                detail = ""
+                try:
+                    detail = e.response.text
+                except Exception:
+                    pass
+                st.error(f"Search failed ({e.response.status_code}). {detail or 'See server logs.'}")
 
 # --------- Report & ELA Tab ---------
 with tab_report:
