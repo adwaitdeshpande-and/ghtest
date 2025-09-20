@@ -11,3 +11,7 @@ data/annotated/118ae3ef-c415-4f27-9417-e28bc112334f_timage.det.jpg
 *.jpg
 *.json
 data/detections/Corporate.detections.json
+
+# large model weights
+*.pt
+weights/
