@@ -15,3 +15,4 @@ data/detections/Corporate.detections.json
 # large model weights
 *.pt
 weights/
+data/detections/Corporate_2.detections.json
