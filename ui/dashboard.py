@@ -338,8 +338,11 @@ with tab_forensics:
                 st.code(json.dumps(summary, indent=2), language="json")
 
 # --------- Detection Tab ---------
+# --------- Detection Tab ---------
 with tab_detect:
     st.subheader("Detection & Tracking")
+
+    # 1) Your existing simple controls (unchanged)
     f_listing = api_forensics_files()
     all_files: List[str] = f_listing.get("files", [])
     video_exts = {".mp4", ".mov", ".mkv", ".avi"}
@@ -444,6 +447,123 @@ with tab_detect:
                 mime="application/json",
                 key="detect_download_json",
             )
+
+    # 2) NEW: Advanced Detection & Tracking (Stored files from data/uploads)
+    st.markdown("---")
+    with st.expander("Advanced Detection & Tracking (Stored uploads: data/uploads)", expanded=True):
+        # Auto-detect API base that exposes /api/* endpoints we added earlier
+        API_BASE_API = API_BASE if API_BASE.rstrip("/").endswith("/api") else (API_BASE.rstrip("/") + "/api")
+
+        import hashlib
+        def _post_api(url_tail: str, data: Dict[str, Any], files: Dict[str, Any] | None = None) -> Dict[str, Any]:
+            url = f"{API_BASE_API}{url_tail}"
+            r = requests.post(url, data=data, files=files, timeout=1200)
+            if not r.ok:
+                raise RuntimeError(f"{url} failed ({r.status_code}): {r.text}")
+            return r.json()
+
+        def _norm_path(p: str | None) -> str | None:
+            if not p: return None
+            pp = Path(p)
+            if not pp.is_absolute():
+                pp = (PROJECT_ROOT / p).resolve()
+            return str(pp)
+
+        def _media_preview(path_like: str | None, title: str):
+            st.markdown(f"**{title}**")
+            if not path_like:
+                st.info("No output path.")
+                return
+            abspath = _norm_path(path_like)
+            if not abspath or not Path(abspath).exists():
+                st.warning(f"Not found: {path_like}")
+                return
+            suf = Path(abspath).suffix.lower()
+            st.caption(f"Path: `{abspath}` • exists: **{Path(abspath).exists()}**")
+            if suf in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}:
+                st.image(abspath, use_container_width=True)
+            elif suf in {".mp4", ".mov", ".m4v", ".webm"}:
+                try:
+                    st.video(abspath)
+                except Exception:
+                    with open(abspath, "rb") as f:
+                        st.video(f.read())
+            else:
+                st.write(f"Saved: `{abspath}`")
+
+        # List stored uploads
+        stored_files = [f for f in all_files]  # already from /forensics/files
+        imgs = [f for f in stored_files if Path(f).suffix.lower() in {".jpg",".jpeg",".png",".bmp",".webp"}]
+        vids = [f for f in stored_files if Path(f).suffix.lower() in {".mp4",".mov",".m4v",".webm",".mkv",".avi"}]
+
+        sub = st.tabs(["Detect (Image, stored)", "Detect (Video, stored)", "Track (Video, stored)"])
+
+        # --- Detect (Image, stored) ---
+        with sub[0]:
+            pick = st.selectbox("Stored image", ["-- select --"] + imgs, index=0, key="adv_det_img_pick")
+            colA, colB, colC = st.columns(3)
+            conf = colA.slider("Confidence", 0.1, 0.9, 0.35, 0.01, key="adv_det_img_conf")
+            iou  = colB.slider("NMS IoU", 0.1, 0.9, 0.50, 0.01, key="adv_det_img_iou")
+            model = colC.selectbox("Model", ["yolov8l.pt", "yolov8x.pt"], index=0, key="adv_det_img_model")
+
+            if st.button("Run detection (by-filename)", disabled=(pick=="-- select --"), key="adv_det_img_run"):
+                res = _post_api(f"/detect/image/by-filename/{pick}", data={"model_name": model, "conf": conf, "iou": iou})
+                st.json(res)
+                _media_preview(res.get("annotated_path"), "Annotated image")
+
+        # --- Detect (Video, stored) ---
+        with sub[1]:
+            pick = st.selectbox("Stored video", ["-- select --"] + vids, index=0, key="adv_det_vid_pick")
+            colA, colB, colC, colD = st.columns(4)
+            conf = colA.slider("Confidence", 0.1, 0.9, 0.35, 0.01, key="adv_det_vid_conf")
+            iou  = colB.slider("NMS IoU", 0.1, 0.9, 0.50, 0.01, key="adv_det_vid_iou")
+            stride = colC.number_input("Frame stride", min_value=1, max_value=8, value=1, step=1, key="adv_det_vid_stride")
+            maxf   = colD.number_input("Max frames", min_value=0, max_value=5000, value=0, step=50, key="adv_det_vid_maxf", help="0 = no cap")
+            model = st.selectbox("Model", ["yolov8l.pt", "yolov8x.pt"], index=0, key="adv_det_vid_model")
+
+            if st.button("Run detection (by-filename)", disabled=(pick=="-- select --"), key="adv_det_vid_run"):
+                data = {
+                    "model_name": model, "conf": conf, "iou": iou,
+                    "stride": int(stride),
+                    "max_frames": None if int(maxf) == 0 else int(maxf),
+                }
+                res = _post_api(f"/detect/video/by-filename/{pick}", data=data)
+                st.json(res)
+                _media_preview(res.get("annotated_path"), "Annotated video")
+
+        # --- Track (Video, stored) ---
+        with sub[2]:
+            pick = st.selectbox("Stored video", ["-- select --"] + vids, index=0, key="adv_trk_vid_pick")
+            colA, colB, colC = st.columns(3)
+            conf = colA.slider("Confidence", 0.1, 0.9, 0.35, 0.01, key="adv_trk_conf")
+            iou  = colB.slider("NMS IoU", 0.1, 0.9, 0.50, 0.01, key="adv_trk_iou")
+            minlen = colC.number_input("Min track length (frames)", min_value=1, max_value=100, value=5, step=1, key="adv_trk_minlen")
+            model = st.selectbox("Model", ["yolov8l.pt", "yolov8x.pt"], index=0, key="adv_trk_model")
+            device = st.selectbox("Device", ["cpu"], index=0, key="adv_trk_device")
+
+            if st.button("Run tracking (by-filename)", disabled=(pick=="-- select --"), key="adv_trk_run"):
+                data = {
+                    "model_name": model, "conf": conf, "iou": iou,
+                    "min_track_len": int(minlen),
+                    "device": None if device == "cpu" else device,
+                }
+                res = _post_api(f"/track/video/by-filename/{pick}", data=data)
+                st.json(res)
+                _media_preview(res.get("annotated_path"), "Annotated tracking video")
+
+                # If your tracker writes derived findings JSON, pull them into the Report tab session
+                try:
+                    fj = res.get("findings_json_path")
+                    if fj:
+                        fpath = Path(_norm_path(fj))
+                        if fpath.exists():
+                            payload = json.loads(fpath.read_text(encoding="utf-8"))
+                            findings = payload.get("findings", [])
+                            if findings and st.button("Add these Findings to the Report", key=f"adv_trk_add_{hash(fj)}"):
+                                st.session_state.setdefault("rep_findings", []).extend(findings)
+                                st.success(f"Added {len(findings)} finding(s) to report session.")
+                except Exception as e:
+                    st.warning(f"Could not read findings: {e}")
 
 # --------- Faces Tab ---------
 with tab_faces:
