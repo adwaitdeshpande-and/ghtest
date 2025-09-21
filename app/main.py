@@ -1,4 +1,5 @@
 # app/main.py
+from __future__ import annotations
 import hashlib
 import uuid
 from pathlib import Path
@@ -8,6 +9,7 @@ import numpy as np
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, validator
+from fastapi.middleware.cors import CORSMiddleware
 # FastAPI / Pydantic
 from fastapi import Body, Query
 from pydantic import BaseModel  # if not already imported
@@ -20,7 +22,7 @@ from app.services.report import (
     generate_report, REPORTS_DIR, ASSETS_DIR,
 )
 # app/main.py  (add these lines)
-
+from app.routers.anpr import router as anpr_router
 
 # --- simple config ---
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -28,7 +30,15 @@ UPLOAD_DIR = PROJECT_ROOT / "data" / "uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="AI CCTV & Digital Media Forensic Tool (MVP)", version="0.5.0")
-
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # tighten for prod
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+app.include_router(anpr_router)
+app.include_router(anpr_router, prefix="/api")
 # --- imports from services ---
 from app.services.metadata import summarize_forensics, is_video, is_image  # noqa: E402
 from app.services.detection import analyze_video_with_motion_stub  # noqa: E402

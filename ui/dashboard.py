@@ -5,6 +5,7 @@ import os, json, mimetypes, datetime, uuid
 from pathlib import Path
 from typing import Dict, Any, List, DefaultDict, Tuple
 from collections import defaultdict
+import subprocess, shutil
 
 import cv2
 import numpy as np
@@ -121,6 +122,19 @@ def _load_json_file(path_like: str | None) -> dict:
         pass
     return {}
 
+# ---- ANPR API helper (add this near the other HTTP helpers) ----
+def api_anpr_by_filename(stored_name: str, params: dict) -> dict:
+    """
+    Call backend ANPR on a stored video.
+    Tries both root and /api prefixes so it works with either mount.
+    """
+    url1 = f"{API_BASE}/anpr/by-filename/{stored_name}"
+    url2 = f"{_api_base_api()}/anpr/by-filename/{stored_name}"
+    r = requests.post(url1, json=params, timeout=1200)
+    if r.status_code == 404:
+        r = requests.post(url2, json=params, timeout=1200)
+    r.raise_for_status()
+    return r.json()
 
 def api_report_generate(payload: dict) -> dict:
     r = requests.post(f"{API_BASE}/report/generate", json=payload, timeout=120)
@@ -192,6 +206,106 @@ def crop_from_source(source_file: str, bbox: List[int], frame_idx: int | None) -
 def _ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
+def _download_button_for_file(path_like: str | None, label: str, key: str, mime: str | None = None):
+    """Render a download button for a local file (project-relative or absolute)."""
+    if not path_like:
+        return
+    p = Path(path_like)
+    if not p.is_absolute():
+        p = (PROJECT_ROOT / path_like).resolve()
+    if not p.exists():
+        return
+    try:
+        data = p.read_bytes()
+        st.download_button(
+            label=label,
+            data=data,
+            file_name=p.name,
+            mime=mime or "application/octet-stream",
+            key=key,
+        )
+    except Exception as e:
+        st.warning(f"Could not create download for {p.name}: {e}")
+
+def _norm_path_any(path_like: str | None) -> str | None:
+    """Normalize a path that may be relative to PROJECT_ROOT, absolute, or use backslashes."""
+    if not path_like:
+        return None
+    path_like = str(path_like).replace("\\", "/")
+    p = Path(path_like)
+    if not p.is_absolute():
+        p = (PROJECT_ROOT / p).resolve()
+    return str(p)
+
+def _make_streamable_preview(src_video_path: str) -> str | None:
+    """
+    If ffmpeg is available, transcode to H.264/AAC MP4 for HTML5 playback.
+    Returns new file path (absolute str) or None.
+    """
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        st.warning("ffmpeg not found in PATH; cannot create streamable preview.")
+        return None
+    src = Path(src_video_path)
+    if not src.exists():
+        st.warning("Source video not found for preview transcode.")
+        return None
+    out_dir = PROJECT_ROOT / "data" / "annotated_previews"
+    _ensure_dir(out_dir)
+    out_path = out_dir / (src.stem + ".preview.mp4")
+    # Fast, browser-friendly settings
+    cmd = [
+        ffmpeg, "-y", "-i", str(src),
+        "-c:v", "libx264", "-preset", "veryfast", "-movflags", "+faststart",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "128k",
+        str(out_path),
+    ]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return str(out_path.resolve())
+    except subprocess.CalledProcessError as e:
+        st.warning(f"ffmpeg failed: {e.stderr.decode('utf-8', errors='ignore')[:500]}")
+        return None
+
+def _video_player_with_fallback(path_like: str, title: str):
+    """
+    Try to play a video. If it fails (codec/container), offer a one-click transcode.
+    """
+    st.markdown(f"**{title}**")
+    abspath = _norm_path_any(path_like)
+    if not abspath or not Path(abspath).exists():
+        st.warning(f"Not found: {path_like}"); return
+
+    # First attempt
+    try:
+        st.video(abspath)
+        return
+    except Exception:
+        pass
+
+    # Second attempt: bytes
+    try:
+        with open(abspath, "rb") as f:
+            st.video(f.read())
+            return
+    except Exception:
+        pass
+
+    # Offer transcode
+    st.error("This video cannot be played inline (likely codec/format).")
+    if st.button(f"Make streamable preview for: {Path(abspath).name}", key=f"mk_streamable_{Path(abspath).name}"):
+        out = _make_streamable_preview(abspath)
+        if out and Path(out).exists():
+            st.success("Preview created. Playing the streamable version below.")
+            try:
+                st.video(out)
+            except Exception:
+                with open(out, "rb") as f:
+                    st.video(f.read())
+        else:
+            st.warning("Could not create a streamable preview. Please download and play locally.")
+
 def _save_snapshot(source_file: str, bbox: List[int] | None, frame_idx: int | None, kind: str, label: str | None) -> str | None:
     """Create a thumbnail crop for report; returns path relative to project root (str)."""
     thumbs_dir = PROJECT_ROOT / "data" / "findings" / "thumbs"
@@ -209,6 +323,53 @@ def _save_snapshot(source_file: str, bbox: List[int] | None, frame_idx: int | No
         return None
     try:
         img.save(out_path, format="JPEG", quality=90)
+        return str(out_path.relative_to(PROJECT_ROOT))
+    except Exception:
+        return None
+def _render_annotated_frame(source_file: str, frame_idx: int | None, bbox: List[int] | None, label: str | None) -> str | None:
+    """
+    Create a FULL-FRAME annotated image (draw bbox+label) for report thumbnails.
+    Returns a project-relative path like 'data/findings/annotated_frames/xxx.jpg'
+    """
+    # Resolve physical path of source under data/uploads
+    src_path = (PROJECT_ROOT / "data" / "uploads" / source_file).resolve()
+    if not src_path.exists():
+        return None
+
+    # Grab the full frame/image
+    if src_path.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}:
+        frame = cv2.imread(str(src_path))
+        if frame is None:
+            return None
+    else:
+        if frame_idx is None:
+            return None
+        cap = cv2.VideoCapture(str(src_path))
+        if not cap.isOpened():
+            return None
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_idx))
+        ok, frame = cap.read()
+        cap.release()
+        if not ok or frame is None:
+            return None
+
+    # Draw bbox + label if present
+    if bbox is not None:
+        x, y, w, h = [int(v) for v in bbox]
+        x2, y2 = x + w, y + h
+        cv2.rectangle(frame, (x, y), (x2, y2), (0, 255, 0), 2)
+        if label:
+            cv2.putText(frame, str(label), (x, max(0, y - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
+
+    out_dir = PROJECT_ROOT / "data" / "findings" / "annotated_frames"
+    _ensure_dir(out_dir)
+    uid = uuid.uuid4().hex[:8]
+    stem = Path(source_file).stem
+    fn = f"{stem}_ann_{(frame_idx if frame_idx is not None else 0)}_{uid}.jpg"
+    out_path = out_dir / fn
+    try:
+        cv2.imwrite(str(out_path), frame)
         return str(out_path.relative_to(PROJECT_ROOT))
     except Exception:
         return None
@@ -380,11 +541,13 @@ def add_candidates_from_detection_result(
                 mid_f = t.get("mid_frame") or t.get("start_frame")
 
             kind = _label_to_kind_for_candidate(label)
-            snap = _save_snapshot(
-                source_filename, bbox,
+            snap = _render_annotated_frame(
+                source_filename,
                 int(mid_f) if mid_f is not None else None,
-                kind, label
-            ) if make_thumbs else None
+                bbox,
+                label
+                ) if make_thumbs else None
+
 
             st.session_state["rep_candidates"].append(
                 _make_candidate(
@@ -411,9 +574,10 @@ def add_candidates_from_detection_result(
             bbox = d.get("bbox")
             kind = _label_to_kind_for_candidate(label)
 
-            snap = _save_snapshot(
-                source_filename, bbox, fidx, kind, label
-            ) if make_thumbs else None
+            snap = _render_annotated_frame(
+                source_filename, fidx, bbox, label
+                ) if make_thumbs else None
+
 
             st.session_state["rep_candidates"].append(
                 _make_candidate(
@@ -435,7 +599,7 @@ def add_candidates_from_face_matches(matches: List[Dict[str, Any]], default_sour
         if not src: continue
         bbox = it.get("bbox"); frame_idx = it.get("frame_idx"); conf = it.get("score") or it.get("similarity")
         label = it.get("name") or it.get("label") or "face"
-        snap = _save_snapshot(src, bbox, frame_idx, "face", label) if (make_thumbs and bbox is not None) else None
+        snap = _render_annotated_frame(src, frame_idx, bbox, label) if (make_thumbs and bbox is not None) else None
         st.session_state["rep_candidates"].append(_make_candidate(src, "face", label, conf, frame_idx, None, bbox, snap, True))
         added += 1
         if added >= max_items: break
@@ -470,59 +634,59 @@ def _candidates_to_report_findings(selected_only: bool = True) -> List[Dict[str,
 # =========================
 # Header
 # =========================
-health_col, files_col = st.columns([1, 2])
-with health_col:
-    st.subheader("Server Health")
-    try:
-        health = api_health()
-        yolo_avail = health.get("yolo_available", "no")
-        st.success(f"Backend is running ✅  |  YOLO: {yolo_avail}" if health.get("status") == "ok" else f"Backend issue: {health.get('status')}")
-    except Exception as e:
-        st.error(f"Cannot reach backend: {e}")
+# health_col, files_col = st.columns([1, 2])
+# with health_col:
+#     st.subheader("Server Health")
+#     try:
+#         health = api_health()
+#         yolo_avail = health.get("yolo_available", "no")
+#         st.success(f"Backend is running ✅  |  YOLO: {yolo_avail}" if health.get("status") == "ok" else f"Backend issue: {health.get('status')}")
+#     except Exception as e:
+#         st.error(f"Cannot reach backend: {e}")
 
-with files_col:
-    st.subheader("Stored Files")
-    if st.button("Refresh list", key="refresh_files"): pass
-    listing = api_list_files(); files = listing.get("files", [])
-    st.write(f"Count: **{listing.get('count', 0)}**")
-    if not files:
-        st.info("No files yet. Upload one below.")
-    else:
-        for f in files:
-            row = st.container(border=True)
-            c1, c2, c3, c4 = row.columns([6, 2, 2, 3])
-            ext = Path(f).suffix.lower()
-            icon = "🎥" if ext in {".mp4",".mov",".mkv",".avi",".m4v",".webm"} else "🖼️"
-            c1.markdown(f"{icon} `{f}`")
-            preview = c2.button("Open", key=f"open_{f}")
-            deepdel = c3.checkbox("deep", value=False, key=f"deep_{f}", help="Also delete annotated/results/tracks/findings")
-            delete = c4.button("Delete", type="secondary", key=f"del_{f}")
-            if preview:
-                try:
-                    summ = api_forensics_by_filename(f)
-                    rel_path = summ.get("path")
-                    if rel_path:
-                        rp = Path(rel_path); rp = rp if rp.is_absolute() else (PROJECT_ROOT / rel_path).resolve()
-                        st.caption(f"Path: `{rp}`"); try_show_media(str(rp.relative_to(PROJECT_ROOT)))
-                except Exception as e:
-                    st.warning(f"Could not preview: {e}")
-            if delete:
-                with row:
-                    st.warning(f"Type the exact filename to confirm delete of `{f}`")
-                    confirm = st.text_input("Confirm name", key=f"confirm_{f}")
-                    go = st.button("Confirm delete", key=f"go_{f}", type="primary")
-                    if go and confirm == f:
-                        try:
-                            res = api_delete_file(f, deepdel); st.success(f"Deleted {res.get('deleted')}. Related: {len(res.get('related_deleted', []))}")
-                            st.rerun()
-                        except requests.HTTPError as e:
-                            status = getattr(e.response, "status_code", "HTTP")
-                            detail = ""
-                            try: detail = e.response.text
-                            except Exception: pass
-                            st.error(f"Delete failed ({status}): {detail or 'See server logs.'}")
+# with files_col:
+#     st.subheader("Stored Files")
+#     if st.button("Refresh list", key="refresh_files"): pass
+#     listing = api_list_files(); files = listing.get("files", [])
+#     st.write(f"Count: **{listing.get('count', 0)}**")
+#     if not files:
+#         st.info("No files yet. Upload one below.")
+#     else:
+#         for f in files:
+#             row = st.container(border=True)
+#             c1, c2, c3, c4 = row.columns([6, 2, 2, 3])
+#             ext = Path(f).suffix.lower()
+#             icon = "🎥" if ext in {".mp4",".mov",".mkv",".avi",".m4v",".webm"} else "🖼️"
+#             c1.markdown(f"{icon} `{f}`")
+#             preview = c2.button("Open", key=f"open_{f}")
+#             deepdel = c3.checkbox("deep", value=False, key=f"deep_{f}", help="Also delete annotated/results/tracks/findings")
+#             delete = c4.button("Delete", type="secondary", key=f"del_{f}")
+#             if preview:
+#                 try:
+#                     summ = api_forensics_by_filename(f)
+#                     rel_path = summ.get("path")
+#                     if rel_path:
+#                         rp = Path(rel_path); rp = rp if rp.is_absolute() else (PROJECT_ROOT / rel_path).resolve()
+#                         st.caption(f"Path: `{rp}`"); try_show_media(str(rp.relative_to(PROJECT_ROOT)))
+#                 except Exception as e:
+#                     st.warning(f"Could not preview: {e}")
+#             if delete:
+#                 with row:
+#                     st.warning(f"Type the exact filename to confirm delete of `{f}`")
+#                     confirm = st.text_input("Confirm name", key=f"confirm_{f}")
+#                     go = st.button("Confirm delete", key=f"go_{f}", type="primary")
+#                     if go and confirm == f:
+#                         try:
+#                             res = api_delete_file(f, deepdel); st.success(f"Deleted {res.get('deleted')}. Related: {len(res.get('related_deleted', []))}")
+#                             st.rerun()
+#                         except requests.HTTPError as e:
+#                             status = getattr(e.response, "status_code", "HTTP")
+#                             detail = ""
+#                             try: detail = e.response.text
+#                             except Exception: pass
+#                             st.error(f"Delete failed ({status}): {detail or 'See server logs.'}")
 
-st.markdown("---")
+# st.markdown("---")
 
 # =========================
 # Tabs (Verify is right-most)
@@ -548,13 +712,13 @@ with tab_upload:
             st.success("Uploaded successfully!"); st.json(resp)
             st.markdown("**Local Preview (from stored path):**"); try_show_media(resp.get("stored_path", ""))
 
-    st.info(
-        "Large file? If the browser upload fails with 413, either drag the file into "
-        "`data/uploads/` in the VS Code Explorer and click **Stored Files → Refresh**, or upload from the terminal inside the Codespace:\n\n"
-        "```bash\n"
-        "curl -F \"file=@/workspaces/ghtest/data/uploads/yourvideo.mp4\" http://127.0.0.1:8000/ingest\n"
-        "```"
-    )
+    # st.info(
+    #     "Large file? If the browser upload fails with 413, either drag the file into "
+    #     "`data/uploads/` in the VS Code Explorer and click **Stored Files → Refresh**, or upload from the terminal inside the Codespace:\n\n"
+    #     "```bash\n"
+    #     "curl -F \"file=@/workspaces/ghtest/data/uploads/yourvideo.mp4\" http://127.0.0.1:8000/ingest\n"
+    #     "```"
+    # )
 
 # --------- Forensics Tab ---------
 with tab_forensics:
@@ -750,7 +914,12 @@ with tab_detect:
             model = colC.selectbox("Model", ["yolov8l.pt","yolov8x.pt"], index=0, key="adv_det_img_model")
             if st.button("Run detection (by-filename)", disabled=(pick=="-- select --"), key="adv_det_img_run"):
                 res = _post_api(f"/detect/image/by-filename/{pick}", data={"model_name": model, "conf": conf, "iou": iou})
-                st.json(res); _media_preview(res.get("annotated_path"), "Annotated image")
+                st.json(res)
+                src_path = res.get("meta", {}).get("source_path") or res.get("source_path") or (PROJECT_ROOT / "data" / "uploads" / pick)
+                c1, c2 = st.columns(2)
+                with c1: _media_preview(str(src_path) if src_path else None, "Source image")
+                with c2: _media_preview(res.get("annotated_path"), "Annotated image")
+
                 # backend findings
                 if auto_add_findings:
                     added0 = 0; fj = res.get("findings_json_path")
@@ -781,7 +950,32 @@ with tab_detect:
             if st.button("Run detection (by-filename)", disabled=(pick=="-- select --"), key="adv_det_vid_run"):
                 data = {"model_name": model, "conf": conf, "iou": iou, "stride": int(stride), "max_frames": None if int(maxf)==0 else int(maxf)}
                 res = _post_api(f"/detect/video/by-filename/{pick}", data=data)
-                st.json(res); _media_preview(res.get("annotated_path"), "Annotated video")
+                st.json(res)
+                src_path = res.get("meta", {}).get("source_path") or res.get("source_path") or (PROJECT_ROOT / "data" / "uploads" / pick)
+                c1, c2 = st.columns(2)
+                with c1:
+                # Source
+                    sp = _norm_path_any(str(src_path))
+                    if sp and Path(sp).suffix.lower() in {".mp4",".mov",".m4v",".webm",".mkv",".avi"}:
+                        _video_player_with_fallback(sp, "Source video")
+                    else:
+                        _media_preview(sp, "Source")
+                with c2:
+    # Annotated
+                    ap = _norm_path_any(res.get("annotated_path"))
+                    if ap and Path(ap).suffix.lower() in {".mp4",".mov",".m4v",".webm",".mkv",".avi"}:
+                        _video_player_with_fallback(ap, "Annotated video")
+                    else:
+                        _media_preview(ap, "Annotated")
+                    annotated_path = res.get("annotated_path")
+                    if annotated_path:
+                        _download_button_for_file(
+                            annotated_path,
+                            "⬇️ Download annotated video",
+                            key="adv_det_vid_dl_annot",
+                            mime="video/mp4",
+                            )
+
                 if auto_add_findings:
                     added0 = 0; fj = res.get("findings_json_path")
                     if fj:
@@ -810,7 +1004,31 @@ with tab_detect:
             if st.button("Run tracking (by-filename)", disabled=(pick=="-- select --"), key="adv_trk_run"):
                 data = {"model_name": model, "conf": conf, "iou": iou, "min_track_len": int(minlen), "device": None if device=="cpu" else device}
                 res = _post_api(f"/track/video/by-filename/{pick}", data=data)
-                st.json(res); _media_preview(res.get("annotated_path"), "Annotated tracking video")
+                st.json(res)
+                src_path = res.get("meta", {}).get("source_path") or res.get("source_path") or (PROJECT_ROOT / "data" / "uploads" / pick)
+                c1, c2 = st.columns(2)
+                with c1:
+                    sp = _norm_path_any(str(src_path))
+                    if sp and Path(sp).suffix.lower() in {".mp4",".mov",".m4v",".webm",".mkv",".avi"}:
+                        _video_player_with_fallback(sp, "Source video")
+                    else:
+                        _media_preview(sp, "Source")
+                with c2:
+                    ap = _norm_path_any(res.get("annotated_path"))
+                    if ap and Path(ap).suffix.lower() in {".mp4",".mov",".m4v",".webm",".mkv",".avi",".det.mp4"}:
+                        _video_player_with_fallback(ap, "Annotated tracking video")
+                    else:
+                        _media_preview(ap, "Annotated tracking")
+                    annotated_path = res.get("annotated_path")
+                    if annotated_path:
+                        _download_button_for_file(
+                            annotated_path,
+                            "⬇️ Download annotated tracking video",
+                            key="adv_trk_vid_dl_annot",
+                            mime="video/mp4",
+                            )
+
+
                 if auto_add_findings:
                     added0 = 0; fj = res.get("findings_json_path")
                     if fj:
@@ -827,6 +1045,7 @@ with tab_detect:
                         c = add_candidates_from_detection_result(res, pick, make_thumbs=True)
                         if c>0: st.success(f"Added {c} candidate(s) to Report → Analysis Findings.")
                     except Exception as e: st.warning(f"Auto-candidate failed: {e}")
+    
 
 # --------- Faces Tab ---------
 with tab_faces:
@@ -1068,32 +1287,31 @@ with tab_report:
     meta_summary = api_forensics_by_filename(ev_pick[0]) if ev_pick else {}
     thumbs = st.session_state.get("_report_ela_thumbs", []); st.write(f"ELA thumbnails queued: **{len(thumbs)}**")
     deepfake = st.slider("Deepfake heuristic score (0..1; optional)", 0.0, 1.0, 0.0, 0.01, key="rep_df")
-
-    # Build + send payload
     if st.button("Generate PDF Report", type="primary", key="rep_generate"):
         try:
-            # merge manual findings + included candidates (mapped)
             candidate_findings = _candidates_to_report_findings(selected_only=True)
             all_findings = list(st.session_state["rep_findings"]) + candidate_findings
-            payload = {"header":{"case_id":h_case_id,"investigator":h_investigator,"station_unit":h_station,"contact":h_contact,"case_notes":h_notes},
-                       "evidence":evidence_payload,
-                       "findings":all_findings,
-                       "forensics":{"metadata_summary":meta_summary,"tamper_flags":[],"ela_thumbnails":thumbs,"deepfake_score":float(deepfake)},
-                       "bundle_json":{}}
-            out = api_report_generate(payload); st.success("Report generated.")
-            st.json({k: v for k,v in out.items() if k not in {"pdf_path","json_path","qr_path"}})
-            _abs = lambda p: str((PROJECT_ROOT / p).resolve())
-# PDF
+            payload = {"header": {"case_id": h_case_id, "investigator": h_investigator, "station_unit": h_station,
+                              "contact": h_contact, "case_notes": h_notes},
+                   "evidence": evidence_payload,
+                   "findings": all_findings,
+                   "forensics": {"metadata_summary": meta_summary, "tamper_flags": [], "ela_thumbnails": thumbs,
+                                 "deepfake_score": float(deepfake)},
+                   "bundle_json": {}}
+            out = api_report_generate(payload);
+            st.success("Report generated.")
+            st.json({k: v for k, v in out.items() if k not in {"pdf_path", "json_path", "qr_path"}})
+            _abs = lambda p: (PROJECT_ROOT / p).resolve()
+
             with open(_abs(out["pdf_path"]), "rb") as f:
                 st.download_button(
                     "Download PDF",
-                    f,
-                    file_name=Path(out["pdf_path"]).name,
-                    mime="application/pdf",
-                    key="dl_pdf"
-                    )
+                f,
+                file_name=Path(out["pdf_path"]).name,
+                mime="application/pdf",
+                key="dl_pdf"
+            )
 
-# JSON
             with open(_abs(out["json_path"]), "rb") as f:
                 st.download_button(
                 "Download JSON bundle",
@@ -1101,9 +1319,8 @@ with tab_report:
                 file_name=Path(out["json_path"]).name,
                 mime="application/json",
                 key="dl_json"
-                )
+            )
 
-# QR
             with open(_abs(out["qr_path"]), "rb") as f:
                 st.download_button(
                 "Download QR image",
@@ -1111,9 +1328,10 @@ with tab_report:
                 file_name=Path(out["qr_path"]).name,
                 mime="image/png",
                 key="dl_qr"
-                )
+            )
         except requests.HTTPError as e:
-            st.error(f"Report generation failed ({getattr(e.response,'status_code','HTTP')}): {e.response.text if e.response else ''}")
+            st.error(
+            f"Report generation failed ({getattr(e.response, 'status_code', 'HTTP')}): {e.response.text if e.response else ''}")
 
 # --------- Verify PDF Tab (right-most)
 with tab_verify:

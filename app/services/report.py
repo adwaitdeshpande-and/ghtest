@@ -487,6 +487,7 @@ def generate_report(spec: ReportSpec) -> Dict[str, Any]:
     json_path = REPORTS_DIR / f"{report_id}.json"
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(bundle, f, ensure_ascii=False, indent=2)
+    
 
     # QR to bundle path (demo)
     qr_path = _qr_png_from_text(str(json_path), f"qr_{report_id}")
