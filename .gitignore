@@ -25,3 +25,5 @@ weights/
 runs/
 ultralytics/
 .venv/
+app/__pycache__/main.cpython-312.pyc
+app/services/__pycache__/metadata.cpython-312.pyc

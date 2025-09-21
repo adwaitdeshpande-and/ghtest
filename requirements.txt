@@ -7,7 +7,6 @@ pillow
 numpy
 streamlit
 opencv-python
-insightfaceaiofiles==24.1.0
 albucore==0.0.24
 albumentations==2.0.8
 altair==5.5.0
@@ -103,10 +102,10 @@ sympy==1.13.3
 tenacity==9.1.2
 threadpoolctl==3.6.0
 tifffile==2025.9.9
-toml==0.10.2
-torch==2.8.0+cpu
-torchaudio==2.8.0+cpu
-torchvision==0.23.0+cpu
+toml
+torch
+torchaudio
+torchvision
 tornado==6.5.2
 tqdm==4.67.1
 typing-inspection==0.4.1

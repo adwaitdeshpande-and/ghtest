@@ -1083,9 +1083,35 @@ with tab_report:
             out = api_report_generate(payload); st.success("Report generated.")
             st.json({k: v for k,v in out.items() if k not in {"pdf_path","json_path","qr_path"}})
             _abs = lambda p: str((PROJECT_ROOT / p).resolve())
-            st.markdown(f"[Download PDF]({_abs(out['pdf_path'])})")
-            st.markdown(f"[Download JSON bundle]({_abs(out['json_path'])})")
-            st.markdown(f"[QR image]({_abs(out['qr_path'])})")
+# PDF
+            with open(_abs(out["pdf_path"]), "rb") as f:
+                st.download_button(
+                    "Download PDF",
+                    f,
+                    file_name=Path(out["pdf_path"]).name,
+                    mime="application/pdf",
+                    key="dl_pdf"
+                    )
+
+# JSON
+            with open(_abs(out["json_path"]), "rb") as f:
+                st.download_button(
+                "Download JSON bundle",
+                f,
+                file_name=Path(out["json_path"]).name,
+                mime="application/json",
+                key="dl_json"
+                )
+
+# QR
+            with open(_abs(out["qr_path"]), "rb") as f:
+                st.download_button(
+                "Download QR image",
+                f,
+                file_name=Path(out["qr_path"]).name,
+                mime="image/png",
+                key="dl_qr"
+                )
         except requests.HTTPError as e:
             st.error(f"Report generation failed ({getattr(e.response,'status_code','HTTP')}): {e.response.text if e.response else ''}")
 
@@ -1109,4 +1135,3 @@ with tab_verify:
             st.code(f"printed report_sha256: {res.get('printed_sha256')}\ncomputed sha256:     {res.get('computed_sha256')}", language="text")
         except requests.HTTPError as e:
             st.error(f"Verify failed ({getattr(e.response,'status_code','HTTP')}): {e.response.text if e.response else ''}")
-##
