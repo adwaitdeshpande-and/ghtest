@@ -630,6 +630,106 @@ def _candidates_to_report_findings(selected_only: bool = True) -> List[Dict[str,
             "source_file": c.get("source_file"),
         })
     return out
+# --- Faces: normalize extract response into a simple list of items ---
+def _coerce_faces_from_extract_response(res: dict) -> list[dict]:
+    """
+    Accepts various server shapes and yields items like:
+    {
+      "image_path": "data/faces/xyz.jpg" (crop saved by server)  OR None,
+      "source_file": "original_video.mp4" or "original_image.jpg",
+      "frame_idx": 123 or None,
+      "bbox": [x,y,w,h] or None,
+      "label": "face", "conf": optional float
+    }
+    """
+    out = []
+    if not isinstance(res, dict):
+        return out
+
+    meta = res.get("meta", {}) or {}
+    default_source = meta.get("source_file") or res.get("source_file")
+
+    # common shapes we support:
+    # A) res["faces"] = [{ "path"/"image_path", "bbox", "frame_idx", "source_file", "conf" }, ...]
+    # B) res["items"]   (same schema)
+    # C) res["saved_paths"] = ["data/faces/...", ...] with optional res["bboxes"], res["frame_indices"]
+    # D) res["results"] = similar to faces
+    buckets = []
+    for key in ("faces", "items", "results"):
+        v = res.get(key)
+        if isinstance(v, list) and v:
+            buckets.append(v)
+
+    if buckets:
+        for arr in buckets:
+            for f in arr:
+                if not isinstance(f, dict):
+                    continue
+                image_path = f.get("path") or f.get("image_path")
+                bbox = f.get("bbox")
+                frame_idx = f.get("frame_idx") or f.get("frame") or None
+                source_file = f.get("source_file") or default_source
+                conf = f.get("conf")
+                out.append({
+                    "image_path": image_path,
+                    "source_file": source_file,
+                    "frame_idx": int(frame_idx) if frame_idx is not None else None,
+                    "bbox": bbox,
+                    "label": "face",
+                    "conf": conf if (conf is None or isinstance(conf, (float, int))) else None,
+                })
+        return out
+
+    # saved_paths + parallel arrays (best effort)
+    saved_paths = res.get("saved_paths") or res.get("paths") or []
+    bboxes = res.get("bboxes") or []
+    frames = res.get("frame_indices") or []
+    if saved_paths:
+        for i, p in enumerate(saved_paths):
+            out.append({
+                "image_path": p,
+                "source_file": default_source,
+                "frame_idx": int(frames[i]) if i < len(frames) and frames[i] is not None else None,
+                "bbox": bboxes[i] if i < len(bboxes) else None,
+                "label": "face",
+                "conf": None,
+            })
+    return out
+
+
+# --- Faces: add extracted faces to report candidates (full-frame annotated) ---
+def add_candidates_from_extracted_faces(items: list[dict], make_thumbs: bool = True, max_items: int = 60) -> int:
+    """
+    For each extracted face item, create a report candidate.
+    Prefer FULL-FRAME annotated snapshot (uses your _render_annotated_frame).
+    Falls back to the cropped image if source info is missing.
+    """
+    st.session_state.setdefault("rep_candidates", [])
+    added = 0
+    for it in items:
+        src = it.get("source_file")
+        bbox = it.get("bbox")
+        fidx = it.get("frame_idx")
+        label = it.get("label") or "face"
+        conf = it.get("conf")
+        snap = None
+
+        if make_thumbs and src and bbox is not None:
+            snap = _render_annotated_frame(src, fidx, bbox, label)  # full-frame with green box+label
+
+        # if no source info, use the crop itself as a representative image
+        if not snap and it.get("image_path"):
+            # store the crop path as snapshot (report builder will embed it)
+            snap = it["image_path"]
+
+        # build candidate (kind="face")
+        st.session_state["rep_candidates"].append(
+            _make_candidate(src or (it.get("image_path") or ""), "face", label, conf, fidx, None, bbox, snap, True)
+        )
+        added += 1
+        if added >= max_items:
+            break
+    return added
 
 # =========================
 # Header
@@ -1066,6 +1166,69 @@ with tab_faces:
         if cols[0].button("Extract faces", disabled=(pick=="-- select --"), key="faces_extract"):
             try: res = api_faces_extract_by_filename(pick, sfps, mframes); st.success("Face extraction complete."); st.json(res)
             except requests.HTTPError as e: st.error(f"Extract failed ({e.response.status_code}): {e.response.text if e.response else ''}")
+            # After: res = api_faces_extract_by_filename(...) or api_faces_extract_from_image(...)
+            st.success("Face extraction completed.")
+            with st.expander("Extraction response (JSON)"):
+                st.code(json.dumps(res, indent=2), language="json")
+
+# Normalize results into a simple list of face items
+            face_items = _coerce_faces_from_extract_response(res)
+
+# Preview grid
+            st.markdown("### Extracted faces preview")
+            if not face_items:
+                st.info("No faces detected / nothing to preview.")
+            else:
+    # Toggle to auto-add to report
+                auto_add_faces = st.checkbox("Auto-add extracted faces to Report → Analysis Findings", value=True, key="faces_auto_add_from_extract")
+
+    # Render a responsive grid of crops (or snapshots)
+                cols = st.columns(6)  # 6 across; adjust if you want bigger thumbnails
+                for i, it in enumerate(face_items):
+                    img_path = it.get("image_path")
+                    src = it.get("source_file")
+                    fidx = it.get("frame_idx")
+                    bbox = it.get("bbox")
+
+                    with cols[i % 6]:
+            # If a crop exists, show it; else try to show a full-frame annotated preview
+                        if img_path:
+                            p = Path(img_path)
+                            if not p.is_absolute():
+                                p = (PROJECT_ROOT / img_path).resolve()
+                            if p.exists():
+                                st.image(str(p), caption=f"{Path(src).name if src else ''}  f:{fidx if fidx is not None else '-'}", use_container_width=True)
+                            else:
+                    # try to synthesize a full-frame annotated preview on the fly
+                                try:
+                                    ann = _render_annotated_frame(src, fidx, bbox, "face") if (src and bbox is not None) else None
+                                    if ann:
+                                        ap = (PROJECT_ROOT / ann).resolve()
+                                        st.image(str(ap), caption=f"{Path(src).name if src else ''}  f:{fidx if fidx is not None else '-'}", use_container_width=True)
+                                    else:
+                                        st.write("Preview unavailable")
+                                except Exception as _e:
+                                    st.write("Preview unavailable")
+                        else:
+                # no crop path; try a full-frame annotation
+                            try:
+                                ann = _render_annotated_frame(src, fidx, bbox, "face") if (src and bbox is not None) else None
+                                if ann:
+                                    ap = (PROJECT_ROOT / ann).resolve()
+                                    st.image(str(ap), caption=f"{Path(src).name if src else ''}  f:{fidx if fidx is not None else '-'}", use_container_width=True)
+                                else:
+                                    st.write("Preview unavailable")
+                            except Exception:
+                                st.write("Preview unavailable")
+
+    # Auto-add to Report candidates
+                if auto_add_faces:
+                    added = add_candidates_from_extracted_faces(face_items, make_thumbs=True, max_items=200)
+                    if added > 0:
+                        st.success(f"Added {added} face candidate(s) to Report → Analysis Findings.")
+                    else:
+                        st.info("No candidates added (empty extraction or missing metadata).")
+##############
         if cols[1].button("Reset index", key="faces_reset"):
             res = api_faces_index_reset(); st.success("Index reset."); st.json(res)
         if cols[2].button("Index faces (add)", disabled=(pick=="-- select --"), key="faces_index_add"):
